@@ -1,2 +1,3 @@
 # yrs-redis
-A Yjs compatible highly available persistent store
+
+A [Yjs](https://yjs.dev/) compatible, highly available, persistent store written in Rust.
