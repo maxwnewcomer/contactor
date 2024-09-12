@@ -1,133 +1,85 @@
 use axum::{
-    extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     response::IntoResponse,
 };
-use axum_extra::TypedHeader;
+use futures::{SinkExt, StreamExt};
+use std::sync::Arc;
+use thiserror::Error;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info};
 
-use std::borrow::Cow;
-use std::net::SocketAddr;
-use std::ops::ControlFlow;
+use crate::broadcast::BroadcastManager;
 
-//allows to extract the IP of connecting user
-use axum::extract::connect_info::ConnectInfo;
-use axum::extract::ws::CloseFrame;
+#[derive(Debug, Error)]
+enum WebSocketError {
+    #[error("WebSocket receive error: {0}")]
+    ReceiveError(#[from] axum::Error),
+    #[error("Unsupported message type")]
+    UnsupportedMessageType,
+}
 
-//allows to split the websocket stream into separate TX and RX branches
-use futures::{sink::SinkExt, stream::StreamExt};
+unsafe impl Send for WebSocketError {}
+unsafe impl Sync for WebSocketError {}
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    user_agent: Option<TypedHeader<headers::UserAgent>>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(broadcast_manager): State<Arc<BroadcastManager>>,
+    Path(room_name): Path<String>,
 ) -> impl IntoResponse {
-    let user_agent = if let Some(TypedHeader(user_agent)) = user_agent {
-        user_agent.to_string()
-    } else {
-        String::from("Unknown browser")
-    };
-    println!("`{user_agent}` at {addr} connected.");
-    // finalize the upgrade process by returning upgrade callback.
-    // we can customize the callback by sending additional info such as address.
-    ws.on_upgrade(move |socket| handle_socket(socket, addr))
+    ws.on_upgrade(move |socket| handle_socket(socket, broadcast_manager.clone(), room_name))
 }
 
-async fn handle_socket(socket: WebSocket, who: SocketAddr) {
-    let (mut sender, mut receiver) = socket.split();
+async fn handle_socket(
+    socket: WebSocket,
+    broadcast_manager: Arc<BroadcastManager>,
+    room_name: String,
+) {
+    let client_id = ulid::Ulid::new();
+    info!("Client {} connected to room '{}'", client_id, room_name);
 
-    // Spawn a task that will push several messages to the client (does not matter what client does)
-    let mut send_task = tokio::spawn(async move {
-        let n_msg = 20;
-        for i in 0..n_msg {
-            // In case of any websocket error, we exit.
-            if sender
-                .send(Message::Text(format!("Server message {i} ...")))
-                .await
-                .is_err()
-            {
-                return i;
-            }
+    // Split the WebSocket into sender and receiver
+    let (ws_tx, ws_rx) = socket.split();
 
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        }
+    // Prepare the sink to send binary messages
+    let sink = ws_tx
+        .with(|data: Vec<u8>| futures::future::ok::<Message, axum::Error>(Message::Binary(data)));
+    let sink = Arc::new(Mutex::new(sink));
 
-        println!("Sending close to {who}...");
-        if let Err(e) = sender
-            .send(Message::Close(Some(CloseFrame {
-                code: axum::extract::ws::close_code::NORMAL,
-                reason: Cow::from("Goodbye"),
-            })))
-            .await
-        {
-            println!("Could not send Close due to {e}, probably it is ok?");
-        }
-        n_msg
+    // Process incoming messages
+    let stream = ws_rx.map(move |result| {
+        result
+            .map_err(WebSocketError::ReceiveError)
+            .and_then(|msg| match msg {
+                Message::Binary(data) => {
+                    debug!("Client {} sent binary data: {:?}", client_id, data);
+                    Ok(data)
+                }
+                Message::Text(text) => {
+                    debug!("Client {} sent text data: {}", client_id, text);
+                    Ok(text.into_bytes())
+                }
+                _ => Err(WebSocketError::UnsupportedMessageType),
+            })
     });
 
-    // This second task will receive messages from client and print them on server console
-    let mut recv_task = tokio::spawn(async move {
-        let mut cnt = 0;
-        while let Some(Ok(msg)) = receiver.next().await {
-            cnt += 1;
-            // print message and break if instructed to do so
-            if process_message(msg, who).is_break() {
-                break;
-            }
-        }
-        cnt
-    });
-
-    // If any one of the tasks exit, abort the other.
-    tokio::select! {
-        rv_a = (&mut send_task) => {
-            match rv_a {
-                Ok(a) => println!("{a} messages sent to {who}"),
-                Err(a) => println!("Error sending messages {a:?}")
-            }
-            recv_task.abort();
-        },
-        rv_b = (&mut recv_task) => {
-            match rv_b {
-                Ok(b) => println!("Received {b} messages"),
-                Err(b) => println!("Error receiving messages {b:?}")
-            }
-            send_task.abort();
-        }
+    // Subscribe the client to the room
+    if let Err(e) = broadcast_manager
+        .subscribe(&room_name, sink.clone(), stream)
+        .await
+    {
+        error!("Client {} subscription error: {}", client_id, e);
     }
 
-    // returning from the handler closes the websocket connection
-    println!("Websocket context {who} destroyed");
-}
-
-/// helper to print contents of messages to stdout. Has special treatment for Close.
-fn process_message(msg: Message, who: SocketAddr) -> ControlFlow<(), ()> {
-    match msg {
-        Message::Text(t) => {
-            println!(">>> {who} sent str: {t:?}");
-        }
-        Message::Binary(d) => {
-            println!(">>> {} sent {} bytes: {:?}", who, d.len(), d);
-        }
-        Message::Close(c) => {
-            if let Some(cf) = c {
-                println!(
-                    ">>> {} sent close with code {} and reason `{}`",
-                    who, cf.code, cf.reason
-                );
-            } else {
-                println!(">>> {who} somehow sent close message without CloseFrame");
-            }
-            return ControlFlow::Break(());
-        }
-
-        Message::Pong(v) => {
-            println!(">>> {who} sent pong with {v:?}");
-        }
-        // You should never need to manually handle Message::Ping, as axum's websocket library
-        // will do so for you automagically by replying with Pong and copying the v according to
-        // spec. But if you need the contents of the pings you can see them here.
-        Message::Ping(v) => {
-            println!(">>> {who} sent ping with {v:?}");
-        }
+    // Unsubscribe the client when the connection is closed
+    if let Err(e) = broadcast_manager.unsubscribe(&room_name).await {
+        error!("Client {} unsubscription error: {}", client_id, e);
     }
-    ControlFlow::Continue(())
+
+    info!(
+        "Client {} disconnected from room '{}'",
+        client_id, room_name
+    );
 }
