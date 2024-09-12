@@ -151,7 +151,7 @@ async fn attempt_room_takeover(
 
     if result > 0 {
         // Successfully removed the old mapping; attempt to create the room
-        let set_result: bool = match redis_conn.set_nx(&room_key, &state.server_address).await {
+        let set_result: bool = match redis_conn.set_nx(&room_key, &state.node_address).await {
             Ok(result) => result,
             Err(err) => {
                 error!("Failed to set room server in Redis: {}", err);

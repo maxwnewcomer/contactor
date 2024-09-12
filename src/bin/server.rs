@@ -25,8 +25,7 @@ async fn main() {
 
     // Load environment variables
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
-    let server_address =
-        env::var("SERVER_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let node_address = env::var("NODE_IP").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
     // Create Redis client
     let redis_client = RedisClient::open(redis_url).expect("Failed to create Redis client");
@@ -43,17 +42,15 @@ async fn main() {
     let app_state = Arc::new(AppState {
         broadcast_manager,
         redis_client,
-        server_address: server_address.clone(),
+        node_address: node_address.clone(),
     });
 
     // Build the application with the correct state
     let app = Router::new()
         .route("/:room_name", get(ws_handler))
         .with_state(app_state.clone())
-        .layer(
-            TraceLayer::new_for_http()
-                .make_span_with(DefaultMakeSpan::default().include_headers(true)),
-        );
+        .layer(TraceLayer::new_for_http().make_span_with(DefaultMakeSpan::default()));
+
     let addr = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
     axum::serve(addr, app.into_make_service()).await.unwrap();
 }

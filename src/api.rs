@@ -11,7 +11,7 @@ use crate::{broadcast::BroadcastManager, relay::build_relay, ws::handle_socket};
 pub struct AppState {
     pub broadcast_manager: Arc<BroadcastManager>,
     pub redis_client: redis::Client,
-    pub server_address: String, // Unique identifier or address of this server
+    pub node_address: String, // Unique identifier or address of this server
 }
 
 pub async fn ws_handler(
@@ -43,7 +43,7 @@ pub async fn ws_handler(
             };
 
             if let Some(server_address) = room_server {
-                if server_address == state.server_address {
+                if server_address == state.node_address {
                     // Room is hosted on this server
                     handle_socket(socket, state.broadcast_manager.clone(), room_name).await;
                 } else {
@@ -52,14 +52,14 @@ pub async fn ws_handler(
                 }
             } else {
                 // Room does not exist; attempt to create it atomically
-                let set_result: bool =
-                    match redis_conn.set_nx(&room_key, &state.server_address).await {
-                        Ok(result) => result,
-                        Err(err) => {
-                            error!("Failed to set room server in Redis: {}", err);
-                            return;
-                        }
-                    };
+                let set_result: bool = match redis_conn.set_nx(&room_key, &state.node_address).await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        error!("Failed to set room server in Redis: {}", err);
+                        return;
+                    }
+                };
 
                 if set_result {
                     // Successfully created the room
