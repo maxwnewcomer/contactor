@@ -1,85 +1,81 @@
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
-    },
+    extract::{ws::WebSocketUpgrade, Path, State},
     response::IntoResponse,
 };
-use futures::{SinkExt, StreamExt};
+use redis::AsyncCommands;
 use std::sync::Arc;
-use thiserror::Error;
-use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::error;
 
-use crate::broadcast::BroadcastManager;
+use crate::{broadcast::BroadcastManager, relay::build_relay, ws::handle_socket};
 
-#[derive(Debug, Error)]
-enum WebSocketError {
-    #[error("WebSocket receive error: {0}")]
-    ReceiveError(#[from] axum::Error),
-    #[error("Unsupported message type")]
-    UnsupportedMessageType,
+pub struct AppState {
+    pub broadcast_manager: Arc<BroadcastManager>,
+    pub redis_client: redis::Client,
+    pub server_address: String, // Unique identifier or address of this server
 }
-
-unsafe impl Send for WebSocketError {}
-unsafe impl Sync for WebSocketError {}
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
-    State(broadcast_manager): State<Arc<BroadcastManager>>,
+    State(state): State<Arc<AppState>>,
     Path(room_name): Path<String>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, broadcast_manager.clone(), room_name))
-}
+    ws.on_upgrade(move |socket| {
+        let state = state.clone();
+        let room_name = room_name.clone();
+        async move {
+            let room_key = format!("room:{}", room_name);
 
-async fn handle_socket(
-    socket: WebSocket,
-    broadcast_manager: Arc<BroadcastManager>,
-    room_name: String,
-) {
-    let client_id = ulid::Ulid::new();
-    info!("Client {} connected to room '{}'", client_id, room_name);
-
-    // Split the WebSocket into sender and receiver
-    let (ws_tx, ws_rx) = socket.split();
-
-    // Prepare the sink to send binary messages
-    let sink = ws_tx
-        .with(|data: Vec<u8>| futures::future::ok::<Message, axum::Error>(Message::Binary(data)));
-    let sink = Arc::new(Mutex::new(sink));
-
-    // Process incoming messages
-    let stream = ws_rx.map(move |result| {
-        result
-            .map_err(WebSocketError::ReceiveError)
-            .and_then(|msg| match msg {
-                Message::Binary(data) => {
-                    debug!("Client {} sent binary data: {:?}", client_id, data);
-                    Ok(data)
+            let mut redis_conn = match state.redis_client.get_multiplexed_async_connection().await {
+                Ok(conn) => conn,
+                Err(err) => {
+                    error!("Failed to get Redis connection: {}", err);
+                    return;
                 }
-                Message::Text(text) => {
-                    debug!("Client {} sent text data: {}", client_id, text);
-                    Ok(text.into_bytes())
+            };
+
+            // Attempt to get the server address for the room
+            let room_server: Option<String> = match redis_conn.get(&room_key).await {
+                Ok(server) => server,
+                Err(err) => {
+                    error!("Failed to get room server from Redis: {}", err);
+                    return;
                 }
-                _ => Err(WebSocketError::UnsupportedMessageType),
-            })
-    });
+            };
 
-    // Subscribe the client to the room
-    if let Err(e) = broadcast_manager
-        .subscribe(&room_name, sink.clone(), stream)
-        .await
-    {
-        error!("Client {} subscription error: {}", client_id, e);
-    }
+            if let Some(server_address) = room_server {
+                if server_address == state.server_address {
+                    // Room is hosted on this server
+                    handle_socket(socket, state.broadcast_manager.clone(), room_name).await;
+                } else {
+                    // Room is on a different server; build a relay
+                    build_relay(socket, server_address, room_name, state).await;
+                }
+            } else {
+                // Room does not exist; attempt to create it atomically
+                let set_result: bool =
+                    match redis_conn.set_nx(&room_key, &state.server_address).await {
+                        Ok(result) => result,
+                        Err(err) => {
+                            error!("Failed to set room server in Redis: {}", err);
+                            return;
+                        }
+                    };
 
-    // Unsubscribe the client when the connection is closed
-    if let Err(e) = broadcast_manager.unsubscribe(&room_name).await {
-        error!("Client {} unsubscription error: {}", client_id, e);
-    }
-
-    info!(
-        "Client {} disconnected from room '{}'",
-        client_id, room_name
-    );
+                if set_result {
+                    // Successfully created the room
+                    handle_socket(socket, state.broadcast_manager.clone(), room_name).await;
+                } else {
+                    // Another server created the room; get the updated server address
+                    let server_address: String = match redis_conn.get(&room_key).await {
+                        Ok(server) => server,
+                        Err(err) => {
+                            error!("Failed to get room server from Redis after set_nx: {}", err);
+                            return;
+                        }
+                    };
+                    build_relay(socket, server_address, room_name, state).await;
+                }
+            }
+        }
+    })
 }

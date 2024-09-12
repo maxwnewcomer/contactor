@@ -1,5 +1,5 @@
 [package]
-name = "yrs_relay"
+name = "yrs-relay"
 version = "0.1.0"
 edition = "2021"
 
@@ -14,10 +14,13 @@ futures-util = { version = "0.3.30", default-features = false, features = [
     "std",
 ] }
 headers = "0.4"
-# redis = { version = "0.27.0", features = ["tokio"] }
+redis = { version = "0.27.0", features = [
+    "tokio-comp",
+    "tokio-native-tls-comp",
+] }
 thiserror = "1.0.63"
 tokio = { version = "1.40.0", features = ["full"] }
-# tokio-tungstenite = "0.23.1"
+tokio-tungstenite = "0.23.1"
 tower-http = { version = "0.5.2", features = ["fs", "trace"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
