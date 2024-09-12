@@ -27,7 +27,6 @@ pub enum BroadcastManagerError {
     StillParticipants { room_name: String },
     #[error("Listener count underflow in room '{room_name}'")]
     ListenerCountUnderflow { room_name: String },
-    // Add other error variants as needed
 }
 
 pub struct BroadcastManager {
