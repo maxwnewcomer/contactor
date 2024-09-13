@@ -15,17 +15,13 @@ use yrs_relay::broadcast::BroadcastManager;
 async fn main() {
     // Initialize tracing subscriber
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                format!("{}=debug,tower_http=debug", env!("CARGO_CRATE_NAME")).into()
-            }),
-        )
+        .with(tracing_subscriber::EnvFilter::new("debug,tower_http=debug"))
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     // Load environment variables
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1/".to_string());
-    let node_address = env::var("NODE_IP").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let node_address = env::var("NODE_ADDRESS").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
 
     // Create Redis client
     let redis_client = RedisClient::open(redis_url).expect("Failed to create Redis client");

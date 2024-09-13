@@ -1,0 +1,27 @@
+version: "3.8"
+
+services:
+  server1:
+    build: .
+    environment:
+      - NODE_ADDRESS=server1:8001
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8001:3000"
+    depends_on:
+      - redis
+
+  server2:
+    build: .
+    environment:
+      - NODE_ADDRESS=server2:8002
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8002:3000"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
