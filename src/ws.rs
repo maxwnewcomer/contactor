@@ -4,7 +4,7 @@ use axum::extract::ws::{Message, WebSocket};
 use futures::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, trace};
 
 use crate::broadcast::BroadcastManager;
 
@@ -31,7 +31,7 @@ pub async fn handle_socket(
                 .map_err(WebSocketError::ReceiveError)
                 .and_then(|msg| match msg {
                     Message::Binary(data) => {
-                        debug!("Client {} sent binary data: {:?}", client_id, data);
+                        trace!("Client {} sent binary data: {:?}", client_id, data);
                         Ok(data)
                     }
                     Message::Text(text) => {

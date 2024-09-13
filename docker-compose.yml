@@ -8,7 +8,7 @@ services:
     volumes:
       - .:/app
     environment:
-      - NODE_ADDRESS=server1:8001
+      - NODE_ADDRESS=server1:3000
       - REDIS_URL=redis://redis:6379
     ports:
       - "8001:3000"
@@ -22,7 +22,7 @@ services:
     volumes:
       - .:/app
     environment:
-      - NODE_ADDRESS=server2:8002
+      - NODE_ADDRESS=server2:3000
       - REDIS_URL=redis://redis:6379
     ports:
       - "8002:3000"

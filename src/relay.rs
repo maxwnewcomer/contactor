@@ -5,7 +5,7 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use redis::AsyncCommands;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
-use tracing::{error, info};
+use tracing::{error, info, trace};
 
 use crate::api::AppState;
 use crate::ws::handle_socket;
@@ -37,6 +37,7 @@ pub async fn build_relay(
                                 Message::Binary(bin) => TungsteniteMessage::Binary(bin),
                                 _ => continue,
                             };
+                            trace!("Passing message {} to {}", msg, current_server_address);
                             if room_ws_sink.send(msg).await.is_err() {
                                 break;
                             }
