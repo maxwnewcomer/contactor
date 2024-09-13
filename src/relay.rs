@@ -5,7 +5,7 @@ use futures::{FutureExt, SinkExt, StreamExt};
 use redis::AsyncCommands;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
-use tracing::error;
+use tracing::{error, info};
 
 use crate::api::AppState;
 use crate::ws::handle_socket;
@@ -20,7 +20,7 @@ pub async fn build_relay(
     let mut socket = Some(socket);
 
     loop {
-        let room_server_url = format!("ws://{}/ws/{}", current_server_address, room_name);
+        let room_server_url = format!("ws://{}/{}", current_server_address, room_name);
 
         match connect_async(&room_server_url).await {
             Ok((room_ws_stream, _)) => {
@@ -115,6 +115,7 @@ async fn attempt_room_takeover(
     room_name: String,
     state: Arc<AppState>,
 ) -> Result<WebSocket, Option<(WebSocket, String)>> {
+    info!("Attempting takeover of room {}", room_name);
     let room_key = format!("room:{}", room_name);
     let mut redis_conn = match state.redis_client.get_multiplexed_async_connection().await {
         Ok(conn) => conn,

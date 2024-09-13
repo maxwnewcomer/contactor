@@ -4,7 +4,7 @@ use axum::{
 };
 use redis::AsyncCommands;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::{broadcast::BroadcastManager, relay::build_relay, ws::handle_socket};
 
@@ -45,8 +45,13 @@ pub async fn ws_handler(
             if let Some(server_address) = room_server {
                 if server_address == state.node_address {
                     // Room is hosted on this server
+                    debug!("Handling connection to '{}' locally", room_name);
                     handle_socket(socket, state.broadcast_manager.clone(), room_name).await;
                 } else {
+                    debug!(
+                        "Expecting room '{}' to be hosted at {}, building relay",
+                        room_name, server_address
+                    );
                     // Room is on a different server; build a relay
                     build_relay(socket, server_address, room_name, state).await;
                 }
@@ -63,6 +68,7 @@ pub async fn ws_handler(
 
                 if set_result {
                     // Successfully created the room
+                    debug!("Room '{}' didn't exist so I created it", room_name);
                     handle_socket(socket, state.broadcast_manager.clone(), room_name).await;
                 } else {
                     // Another server created the room; get the updated server address
@@ -73,6 +79,10 @@ pub async fn ws_handler(
                             return;
                         }
                     };
+                    debug!(
+                        "Tried to build room '{}' but {} got to it first, building relay",
+                        room_name, server_address
+                    );
                     build_relay(socket, server_address, room_name, state).await;
                 }
             }
