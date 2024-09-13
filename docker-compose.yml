@@ -2,7 +2,11 @@ version: "3.8"
 
 services:
   server1:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.dev # Use the development Dockerfile
+    volumes:
+      - .:/app
     environment:
       - NODE_ADDRESS=server1:8001
       - REDIS_URL=redis://redis:6379
@@ -12,7 +16,11 @@ services:
       - redis
 
   server2:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
     environment:
       - NODE_ADDRESS=server2:8002
       - REDIS_URL=redis://redis:6379
