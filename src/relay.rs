@@ -1,3 +1,5 @@
+//! Module handling WebSocket connections and relaying messages between clients and rooms.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,14 +21,21 @@ use crate::broadcast::{BroadcastManager, BroadcastManagerError};
 use crate::ids::IdFactory;
 use crate::RedisKeygenerator;
 
+/// Represents a relay node responsible for handling client connections and room management.
 pub struct RelayNode {
+    /// The network address of the relay node.
     pub address: String,
+    /// The unique identifier of the relay node.
     pub id: String,
+    /// Redis client for interacting with the Redis server.
     redis: redis::Client,
+    /// Manages broadcasting to clients across rooms.
     broadcast_manager: Arc<BroadcastManager>,
+    /// Factory for generating unique IDs.
     id_factory: Arc<IdFactory>,
 }
 
+/// Struct for serializing node information.
 #[derive(Serialize)]
 struct NodeInfo {
     address: String,
@@ -37,6 +46,7 @@ struct NodeInfo {
     used_memory: u64,
 }
 
+/// Struct for serializing and deserializing room information.
 #[derive(Serialize, Deserialize)]
 struct RoomInfo {
     address: String,
@@ -45,6 +55,12 @@ struct RoomInfo {
 }
 
 impl RelayNode {
+    /// Creates a new `RelayNode` and starts the node info worker.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` - The network address of the relay node.
+    /// * `redis` - A Redis client.
     pub fn new(address: String, redis: redis::Client) -> Self {
         let factory = IdFactory::new();
         let relay_node = RelayNode {
@@ -61,6 +77,7 @@ impl RelayNode {
         relay_node
     }
 
+    /// Starts a background task that periodically reports node info to Redis.
     fn start_node_info_worker(&self) {
         let redis_clone = self.redis.clone();
         let broadcast_manager_clone = self.broadcast_manager.clone();
@@ -131,6 +148,12 @@ impl RelayNode {
         });
     }
 
+    /// Starts a background task that periodically reports room info to Redis.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_name` - The name of the room.
+    /// * `shutdown_rx` - A receiver for shutdown signals.
     fn start_room_info_worker(&self, room_name: String, mut shutdown_rx: watch::Receiver<()>) {
         let redis_clone = self.redis.clone();
         let id = self.id.clone();
@@ -194,6 +217,12 @@ impl RelayNode {
         });
     }
 
+    /// Handles a WebSocket upgrade by routing the connection to the appropriate room or building a relay.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket` - The WebSocket connection.
+    /// * `room_name` - The name of the room to connect to.
     pub async fn handle_upgrade(&self, socket: WebSocket, room_name: String) {
         let room_key = RedisKeygenerator::room_key(&room_name);
         let mut redis_conn = match self.redis.get_multiplexed_async_connection().await {
@@ -352,6 +381,13 @@ impl RelayNode {
         }
     }
 
+    /// Builds a relay between the client and the current room server.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket` - The WebSocket connection from the client.
+    /// * `current_room_server` - The address of the current room server.
+    /// * `room_name` - The name of the room.
     pub async fn build_relay(
         &self,
         socket: WebSocket,
@@ -445,6 +481,16 @@ impl RelayNode {
         }
     }
 
+    /// Attempts to take over a room if the current server is unresponsive.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket` - The WebSocket connection from the client.
+    /// * `room_name` - The name of the room.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` indicating success or an `Option` containing the socket and new server address.
     async fn attempt_room_takeover(
         &self,
         socket: WebSocket,
@@ -572,6 +618,12 @@ impl RelayNode {
         }
     }
 
+    /// Handles the WebSocket connection for a specific room.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket` - The WebSocket connection.
+    /// * `room_name` - The name of the room.
     pub async fn handle_socket(&self, socket: WebSocket, room_name: String) {
         let client_id = Arc::new(self.id_factory.gen_id());
         info!("Client {} connected to room '{}'", client_id, room_name);
@@ -699,10 +751,14 @@ impl RelayNode {
     }
 }
 
+/// Errors that can occur when handling WebSocket messages.
 #[derive(Debug, Error)]
 enum WebSocketError {
+    /// An error occurred while receiving a WebSocket message.
     #[error("WebSocket receive error: {0}")]
     ReceiveError(#[from] axum::Error),
+
+    /// An unsupported message type was received.
     #[error("Unsupported message type")]
     UnsupportedMessageType,
 }
