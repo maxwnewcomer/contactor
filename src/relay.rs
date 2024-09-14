@@ -7,7 +7,7 @@ use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use sysinfo::System;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
@@ -15,7 +15,7 @@ use tracing::{debug, error, info, trace};
 use yrs::sync::Awareness;
 use yrs::Doc;
 
-use crate::broadcast::BroadcastManager;
+use crate::broadcast::{BroadcastManager, BroadcastManagerError};
 use crate::ids::IdFactory;
 use crate::RedisKeygenerator;
 
@@ -131,7 +131,7 @@ impl RelayNode {
         });
     }
 
-    fn start_room_info_worker(&self, room_name: String) {
+    fn start_room_info_worker(&self, room_name: String, mut shutdown_rx: watch::Receiver<()>) {
         let redis_clone = self.redis.clone();
         let id = self.id.clone();
         let address_clone = self.address.clone();
@@ -141,6 +141,12 @@ impl RelayNode {
         // Spawn the room info worker as a background task
         tokio::spawn(async move {
             loop {
+                // Check for shutdown signal
+                if shutdown_rx.has_changed().unwrap_or(false) {
+                    info!("Shutting down room info worker for room '{}'", room_name);
+                    break;
+                }
+
                 // Create the room info to report
                 let room_info = RoomInfo {
                     address: address_clone.clone(),
@@ -177,15 +183,19 @@ impl RelayNode {
                 }
 
                 // Sleep before next report
-                sleep(Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(5)) => {},
+                    _ = shutdown_rx.changed() => {
+                        info!("Shutting down room info worker for room '{}'", room_name);
+                        break;
+                    }
+                }
             }
         });
     }
 
     pub async fn handle_upgrade(&self, socket: WebSocket, room_name: String) {
-        let room = room_name.clone();
         let room_key = RedisKeygenerator::room_key(&room_name);
-        let mut try_drop_room = false;
         let mut redis_conn = match self.redis.get_multiplexed_async_connection().await {
             Ok(conn) => conn,
             Err(err) => {
@@ -217,7 +227,6 @@ impl RelayNode {
                 // Room is hosted on this server
                 debug!("Handling connection to '{}' locally", room_name);
                 self.handle_socket(socket, room_name.clone()).await;
-                try_drop_room = true;
             } else {
                 debug!(
                     "Expecting room '{}' to be hosted at {}, building relay",
@@ -297,14 +306,19 @@ impl RelayNode {
                 debug!("Room '{}' didn't exist so I created it", room_name);
 
                 // Start the room info worker to refresh TTL
-                self.start_room_info_worker(room_name.clone());
+                let (shutdown_tx, shutdown_rx) = watch::channel(());
+                self.broadcast_manager
+                    .store_room_shutdown_signal(&room_name, shutdown_tx)
+                    .await;
+
+                self.start_room_info_worker(room_name.clone(), shutdown_rx);
+                // Handle the socket
                 self.handle_socket(socket, room_name.clone()).await;
-                try_drop_room = true;
             } else {
                 // Another server created the room; get the updated room info
 
                 // Tear down local room
-                if let Err(e) = self.broadcast_manager.drop_room(&room_name).await {
+                if let Err(e) = self.broadcast_manager.drop_room(&room_name) {
                     error!(
                         "Failed to remove pre-created room from broadcast manager: {}",
                         e
@@ -334,16 +348,6 @@ impl RelayNode {
                 );
                 self.build_relay(socket, room_info.address.clone(), room_name.clone())
                     .await;
-            }
-        }
-
-        if try_drop_room && self.broadcast_manager.drop_room(&room).await.is_ok() {
-            // Remove room info from Redis
-            match redis_conn.del::<&String, i32>(&room_key).await {
-                Ok(_) => {}
-                Err(e) => {
-                    error!("Failed to drop room_key '{}' from Redis: {}", room_key, e);
-                }
             }
         }
     }
@@ -523,8 +527,12 @@ impl RelayNode {
                 // Successfully took over the room
 
                 // Start the room info worker to refresh TTL
-                let room_info_key = room_key.clone();
-                self.start_room_info_worker(room_info_key);
+                let (shutdown_tx, shutdown_rx) = watch::channel(());
+                self.broadcast_manager
+                    .store_room_shutdown_signal(&room_name, shutdown_tx)
+                    .await;
+
+                self.start_room_info_worker(room_name.clone(), shutdown_rx);
 
                 Ok(socket)
             } else {
@@ -568,6 +576,15 @@ impl RelayNode {
         let client_id = Arc::new(self.id_factory.gen_id());
         info!("Client {} connected to room '{}'", client_id, room_name);
 
+        let room_key = RedisKeygenerator::room_key(&room_name);
+        let mut redis_conn = match self.redis.get_multiplexed_async_connection().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                error!("Failed to get Redis connection: {}", err);
+                return;
+            }
+        };
+
         // Split the WebSocket into sender and receiver
         let (ws_tx, ws_rx) = socket.split();
 
@@ -606,7 +623,6 @@ impl RelayNode {
         let subscription = match self
             .broadcast_manager
             .subscribe(&room_name, sink.clone(), stream)
-            .await
         {
             Ok(sub) => sub,
             Err(e) => {
@@ -624,14 +640,56 @@ impl RelayNode {
             error!("Client {} subscription error: {}", client_id, e);
         }
 
-        // // Close the WebSocket connection
+        // Close the WebSocket connection
         if let Err(e) = sink.lock().await.close().await {
             error!("Failed to close WebSocket: {}", e);
         }
 
         // Unsubscribe the client when the connection is closed
-        if let Err(e) = self.broadcast_manager.unsubscribe(&room_name).await {
+        if let Err(e) = self.broadcast_manager.unsubscribe(&room_name) {
             error!("Client {} unsubscription error: {}", client_id, e);
+        }
+
+        // After unsubscribing, get the updated listener count
+        if let Some(0) = self.broadcast_manager.listeners(&room_name) {
+            // Attempt to drop the room
+            match self.broadcast_manager.drop_room(&room_name) {
+                Ok(_) => {
+                    // Room was successfully dropped
+                    debug!("Room '{}' dropped", room_name);
+
+                    // Send shutdown signal to the room info worker
+                    if let Some(shutdown_tx) = self
+                        .broadcast_manager
+                        .remove_room_shutdown_signal(&room_name)
+                        .await
+                    {
+                        let _ = shutdown_tx.send(());
+                    }
+
+                    // Remove room info from Redis
+                    match redis_conn.del::<&String, i32>(&room_key).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!("Failed to drop room_key '{}' from Redis: {}", room_key, e);
+                        }
+                    }
+                }
+                Err(BroadcastManagerError::StillParticipants { .. }) => {
+                    // Room still has participants; do not proceed
+                    debug!("Room '{}' still has participants; not dropping", room_name);
+                }
+                Err(e) => {
+                    error!("Failed to drop room '{}': {}", room_name, e);
+                }
+            }
+        } else {
+            // Room still has listeners or does not exist; do nothing
+            debug!(
+                "Room '{}' not dropped. Listeners: {:?}",
+                room_name,
+                self.broadcast_manager.listeners(&room_name)
+            );
         }
 
         info!(
