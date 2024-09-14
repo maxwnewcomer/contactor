@@ -1,11 +1,11 @@
 //! Main library module for the crate.
 //!
-//! This module re-exports the `api` and `relay` modules and includes internal utilities.
+//! This module re-exports the `api`, `relay`, and `broadcast` modules and includes internal utilities.
 
 pub mod api;
+pub mod broadcast;
 pub mod relay;
 
-pub(crate) mod broadcast;
 pub(crate) mod ids;
 
 /// A utility struct for generating Redis keys for rooms and nodes.
