@@ -235,3 +235,222 @@ impl BroadcastManager {
         signals.remove(room_name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::channel::mpsc;
+    use futures::future::join_all;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use std::io;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{Mutex, RwLock};
+    use yrs::sync::Awareness;
+    use yrs::Doc;
+
+    // Helper function to create a mock AwarenessRef
+    fn create_mock_awareness() -> AwarenessRef {
+        Arc::new(RwLock::new(Awareness::new(Doc::new())))
+    }
+
+    // Helper function to create a mock stream
+    fn create_mock_stream() -> impl StreamExt<Item = Result<Vec<u8>, io::Error>> {
+        futures::stream::empty()
+    }
+
+    #[tokio::test]
+    async fn test_create_room() {
+        let manager = BroadcastManager::new();
+        let awareness = create_mock_awareness();
+
+        // Test creating a new room
+        assert!(manager
+            .create_room("room1", awareness.clone())
+            .await
+            .is_ok());
+
+        // Test creating a room that already exists
+        let result = manager.create_room("room1", awareness).await;
+        assert!(matches!(
+            result,
+            Err(BroadcastManagerError::RoomAlreadyExists { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_and_unsubscribe() {
+        let manager = BroadcastManager::new();
+        let awareness = create_mock_awareness();
+
+        // Create a room
+        manager.create_room("room1", awareness).await.unwrap();
+
+        // Create a mock sink and stream
+        let (tx, _rx) = mpsc::channel(10);
+        let sink = Arc::new(Mutex::new(tx));
+        let stream = create_mock_stream();
+
+        // Test subscribing
+        let subscription = manager.subscribe("room1", sink.clone(), stream);
+        assert!(subscription.is_ok());
+
+        // Test unsubscribing
+        assert!(manager.unsubscribe("room1").is_ok());
+
+        // Test unsubscribing from a non-existent room
+        let result = manager.unsubscribe("non_existent_room");
+        assert!(matches!(
+            result,
+            Err(BroadcastManagerError::RoomNotFound { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_drop_room() {
+        let manager = BroadcastManager::new();
+        let awareness = create_mock_awareness();
+
+        // Create a room
+        manager.create_room("room1", awareness).await.unwrap();
+
+        // Test dropping an empty room
+        assert!(manager.drop_room("room1").is_ok());
+
+        // Test dropping a non-existent room
+        assert!(manager.drop_room("non_existent_room").is_ok());
+
+        // Create a new room and subscribe to it
+        manager
+            .create_room("room2", create_mock_awareness())
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(10);
+        let sink = Arc::new(Mutex::new(tx));
+        let stream = create_mock_stream();
+        manager.subscribe("room2", sink, stream).unwrap();
+
+        // Test dropping a room with active listeners
+        let result = manager.drop_room("room2");
+        assert!(matches!(
+            result,
+            Err(BroadcastManagerError::StillParticipants { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_multiple_subscriptions() {
+        let manager = BroadcastManager::new();
+        let awareness = create_mock_awareness();
+
+        // Create a room
+        manager.create_room("room1", awareness).await.unwrap();
+
+        // Create multiple subscriptions
+        for _ in 0..3 {
+            let (tx, _rx) = mpsc::channel(10);
+            let sink = Arc::new(Mutex::new(tx));
+            let stream = create_mock_stream();
+            manager.subscribe("room1", sink, stream).unwrap();
+        }
+
+        // Try to drop the room (should fail due to active listeners)
+        let result = manager.drop_room("room1");
+        assert!(matches!(
+            result,
+            Err(BroadcastManagerError::StillParticipants { .. })
+        ));
+
+        // Unsubscribe all
+        for _ in 0..3 {
+            manager.unsubscribe("room1").unwrap();
+        }
+
+        // Now dropping should succeed
+        assert!(manager.drop_room("room1").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_complex_concurrent_operations() {
+        let manager = Arc::new(BroadcastManager::new());
+        let num_rooms = 30;
+        let num_operations_per_room = 100;
+
+        // Create rooms
+        for i in 0..num_rooms {
+            let awareness = create_mock_awareness();
+            manager
+                .create_room(&format!("room-{}", i), awareness)
+                .await
+                .unwrap();
+        }
+
+        // Spawn tasks for each room
+        let mut tasks = vec![];
+        for room_id in 0..num_rooms {
+            let manager_clone = manager.clone();
+            let task = tokio::spawn(async move {
+                // Create a thread-safe RNG
+                let mut rng = StdRng::from_entropy();
+                let room_name = format!("room-{}", room_id);
+
+                for _ in 0..num_operations_per_room {
+                    let operation = rng.gen_range(0..4);
+                    match operation {
+                        0 => {
+                            // Subscribe
+                            let (tx, _rx) = mpsc::channel(10);
+                            let sink = Arc::new(Mutex::new(tx));
+                            let stream = create_mock_stream();
+                            let _ = manager_clone.subscribe(&room_name, sink, stream);
+                        }
+                        1 => {
+                            // Unsubscribe
+                            let _ = manager_clone.unsubscribe(&room_name);
+                        }
+                        2 => {
+                            // Attempt to drop
+                            let _ = manager_clone.drop_room(&room_name);
+                        }
+                        3 => {
+                            // Simulate some processing time
+                            tokio::time::sleep(Duration::from_millis(rng.gen_range(1..10))).await;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+            });
+            tasks.push(task);
+        }
+
+        // Wait for all tasks to complete
+        let results = join_all(tasks).await;
+
+        // Check if any task panicked
+        for result in results {
+            assert!(result.is_ok());
+        }
+
+        // Verify final state
+        for i in 0..num_rooms {
+            let room_name = format!("room-{}", i);
+            let result = manager.drop_room(&room_name);
+            match result {
+                Ok(()) => {
+                    // Room was successfully dropped, which means it had no listeners
+                    println!("Room {} was successfully dropped", room_name);
+                }
+                Err(BroadcastManagerError::StillParticipants { .. }) => {
+                    // Room still has listeners
+                    println!("Room {} still has listeners", room_name);
+                }
+                Err(BroadcastManagerError::RoomNotFound { .. }) => {
+                    // Room was already dropped during the test
+                    println!("Room {} was already dropped", room_name);
+                }
+                _ => panic!("Unexpected error for room {}", room_name),
+            }
+        }
+    }
+}
