@@ -1,0 +1,17 @@
+# Use the official Rust image for development
+FROM rust:1.80 AS dev
+
+# Install cargo-watch for automatic recompilation
+RUN cargo install cargo-watch
+
+# Set the working directory
+WORKDIR /app
+
+# Copy your source code into the container
+COPY . .
+
+# Expose the application port
+EXPOSE 8001
+
+# Command to run cargo watch
+CMD ["cargo", "watch", "-x", "run"]

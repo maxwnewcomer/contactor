@@ -1,0 +1,33 @@
+services:
+  server1:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev # Use the development Dockerfile
+    volumes:
+      - .:/app
+    environment:
+      - NODE_ADDRESS=server1:3000
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8001:3000"
+    depends_on:
+      - redis
+
+  server2:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
+    environment:
+      - NODE_ADDRESS=server2:3000
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8002:3000"
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
