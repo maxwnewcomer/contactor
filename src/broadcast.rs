@@ -40,6 +40,23 @@ impl BroadcastManager {
         }
     }
 
+    pub fn num_rooms(&self) -> usize {
+        self.rooms.len()
+    }
+
+    pub fn total_listeners(&self) -> usize {
+        self.rooms
+            .iter()
+            .map(|entry| entry.value().listeners.load(Ordering::SeqCst))
+            .sum()
+    }
+
+    pub fn listeners(&self, room_name: &str) -> Option<usize> {
+        self.rooms
+            .get(room_name)
+            .map(|room| room.listeners.load(Ordering::Relaxed))
+    }
+
     pub async fn subscribe<Sink, Stream, E>(
         &self,
         room_name: &str,
@@ -114,19 +131,6 @@ impl BroadcastManager {
         };
         self.rooms.insert(room_name.to_string(), room);
         Ok(())
-    }
-
-    pub async fn get_awareness(
-        &self,
-        room_name: &str,
-    ) -> Result<AwarenessRef, BroadcastManagerError> {
-        if let Some(room) = self.rooms.get(room_name) {
-            Ok(room.bcast.awareness().clone())
-        } else {
-            Err(BroadcastManagerError::RoomNotFound {
-                room_name: room_name.to_string(),
-            })
-        }
     }
 }
 

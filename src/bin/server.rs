@@ -2,14 +2,11 @@ use axum::{routing::get, Router};
 use redis::Client as RedisClient;
 use std::env;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower_http::trace::{DefaultMakeSpan, TraceLayer};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use yrs::sync::Awareness;
-use yrs::Doc;
 use yrs_relay::api::ws_handler;
 use yrs_relay::api::AppState;
-use yrs_relay::broadcast::BroadcastManager;
+use yrs_relay::relay::RelayNode;
 
 #[tokio::main]
 async fn main() {
@@ -26,19 +23,11 @@ async fn main() {
     // Create Redis client
     let redis_client = RedisClient::open(redis_url).expect("Failed to create Redis client");
 
-    // Create BroadcastManager
-    let broadcast_manager = Arc::new(BroadcastManager::new());
-
-    // Optionally, create a default room (if needed)
-    let _ = broadcast_manager
-        .create_room("default", Arc::new(RwLock::new(Awareness::new(Doc::new()))))
-        .await;
+    let node = RelayNode::new(node_address, redis_client);
 
     // Create AppState
     let app_state = Arc::new(AppState {
-        broadcast_manager,
-        redis_client,
-        node_address: node_address.clone(),
+        node: Arc::new(node),
     });
 
     // Build the application with the correct state
