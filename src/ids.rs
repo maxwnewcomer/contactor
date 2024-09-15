@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rand::rngs::SmallRng;
@@ -7,6 +8,14 @@ use sqids::Sqids;
 pub struct IdFactory {
     sqids: Sqids,
     internal_count: AtomicU64,
+}
+
+impl Debug for IdFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdFactory")
+            .field("internal_count", &self.internal_count)
+            .finish()
+    }
 }
 
 impl IdFactory {

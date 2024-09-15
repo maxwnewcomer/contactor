@@ -1,5 +1,6 @@
 //! Module handling WebSocket connections and relaying messages between clients and rooms.
 
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,6 +34,15 @@ pub struct RelayNode {
     broadcast_manager: Arc<BroadcastManager>,
     /// Factory for generating unique IDs.
     id_factory: Arc<IdFactory>,
+}
+
+impl Debug for RelayNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayNode")
+            .field("address", &self.address)
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 /// Struct for serializing node information.
@@ -78,6 +88,7 @@ impl RelayNode {
     }
 
     /// Starts a background task that periodically reports node info to Redis.
+    #[tracing::instrument]
     fn start_node_info_worker(&self) {
         let redis_clone = self.redis.clone();
         let broadcast_manager_clone = self.broadcast_manager.clone();
@@ -154,6 +165,7 @@ impl RelayNode {
     ///
     /// * `room_name` - The name of the room.
     /// * `shutdown_rx` - A receiver for shutdown signals.
+    #[tracing::instrument]
     fn start_room_info_worker(&self, room_name: String, mut shutdown_rx: watch::Receiver<()>) {
         let redis_clone = self.redis.clone();
         let id = self.id.clone();
@@ -223,6 +235,7 @@ impl RelayNode {
     ///
     /// * `socket` - The WebSocket connection.
     /// * `room_name` - The name of the room to connect to.
+    #[tracing::instrument(skip(socket))]
     pub async fn handle_upgrade(&self, socket: WebSocket, room_name: String) {
         let room_key = RedisKeygenerator::room_key(&room_name);
         let mut redis_conn = match self.redis.get_multiplexed_async_connection().await {
@@ -388,6 +401,7 @@ impl RelayNode {
     /// * `socket` - The WebSocket connection from the client.
     /// * `current_room_server` - The address of the current room server.
     /// * `room_name` - The name of the room.
+    #[tracing::instrument(skip(socket))]
     pub async fn build_relay(
         &self,
         socket: WebSocket,
@@ -491,6 +505,7 @@ impl RelayNode {
     /// # Returns
     ///
     /// A `Result` indicating success or an `Option` containing the socket and new server address.
+    #[tracing::instrument(skip(socket))]
     async fn attempt_room_takeover(
         &self,
         socket: WebSocket,
@@ -624,6 +639,7 @@ impl RelayNode {
     ///
     /// * `socket` - The WebSocket connection.
     /// * `room_name` - The name of the room.
+    #[tracing::instrument(skip(socket))]
     pub async fn handle_socket(&self, socket: WebSocket, room_name: String) {
         let client_id = Arc::new(self.id_factory.gen_id());
         info!("Client {} connected to room '{}'", client_id, room_name);

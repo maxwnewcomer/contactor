@@ -7,7 +7,9 @@ edition = "2021"
 anyhow = "1.0.88"
 axum = { version = "0.7.5", features = ["ws"] }
 axum-extra = { version = "0.9.3", features = ["typed-header"] }
+config = "0.14.0"
 dashmap = "6.1.0"
+dotenvy = "0.15.7"
 futures = "0.3.30"
 futures-util = { version = "0.3.30", default-features = false, features = [
     "sink",
@@ -15,7 +17,7 @@ futures-util = { version = "0.3.30", default-features = false, features = [
 ] }
 headers = "0.4"
 rand = { version = "0.8.5", features = ["small_rng"] }
-redis = { version = "0.27.0", features = [
+redis = { version = "0.27.1", features = [
     "tokio-comp",
     "tokio-native-tls-comp",
 ] }
@@ -25,7 +27,7 @@ sqids = "0.4.1"
 sysinfo = "0.31.4"
 thiserror = "1.0.63"
 tokio = { version = "1.40.0", features = ["full"] }
-tokio-tungstenite = "0.23.1"
+tokio-tungstenite = "0.24.0"
 tower-http = { version = "0.5.2", features = ["fs", "trace"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

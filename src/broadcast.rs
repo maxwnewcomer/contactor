@@ -4,6 +4,7 @@ use anyhow::Result;
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -50,6 +51,15 @@ pub struct BroadcastManager {
     rooms: DashMap<String, Room>,
     /// A mutex-protected map for room shutdown signals.
     room_shutdown_signals: Mutex<HashMap<String, watch::Sender<()>>>,
+}
+
+impl Debug for BroadcastManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BroadcastManager")
+            // .field("rooms", &self.rooms)
+            // .field("room_shutdown_signals", &self.room_shutdown_signals)
+            .finish()
+    }
 }
 
 impl BroadcastManager {
