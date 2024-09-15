@@ -14,4 +14,4 @@ COPY . .
 EXPOSE 8001
 
 # Command to run cargo watch
-CMD ["cargo", "watch", "-x", "run"]
+ENTRYPOINT cargo watch -w server -- cargo run --package yrs-relay
