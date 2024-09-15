@@ -27,6 +27,34 @@ services:
     depends_on:
       - redis
 
+  server3:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev # Use the development Dockerfile
+    volumes:
+      - .:/app
+    environment:
+      - NODE_ADDRESS=server3:3000
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8003:3000"
+    depends_on:
+      - redis
+
+  server4:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
+    environment:
+      - NODE_ADDRESS=server4:3000
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "8004:3000"
+    depends_on:
+      - redis
+
   redis:
     image: redis:alpine
     ports:
