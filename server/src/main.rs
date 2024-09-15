@@ -37,7 +37,11 @@ async fn main() {
     // Create Redis client
     let redis_client = RedisClient::open(config.redis_url).expect("Failed to create Redis client");
 
-    let node = RelayNode::new(config.node_address, redis_client);
+    let node = RelayNode::builder()
+        .address(config.node_address)
+        .redis(redis_client)
+        .build()
+        .expect("failed to build relay node");
 
     // Create AppState
     let app_state = Arc::new(AppState {

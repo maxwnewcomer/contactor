@@ -4,6 +4,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use futures::{FutureExt, SinkExt, StreamExt};
 use redis::AsyncCommands;
@@ -22,29 +23,6 @@ use crate::broadcast::{BroadcastManager, BroadcastManagerError};
 use crate::ids::IdFactory;
 use crate::RedisKeygenerator;
 
-/// Represents a relay node responsible for handling client connections and room management.
-pub struct RelayNode {
-    /// The network address of the relay node.
-    pub address: String,
-    /// The unique identifier of the relay node.
-    pub id: String,
-    /// Redis client for interacting with the Redis server.
-    redis: redis::Client,
-    /// Manages broadcasting to clients across rooms.
-    broadcast_manager: Arc<BroadcastManager>,
-    /// Factory for generating unique IDs.
-    id_factory: Arc<IdFactory>,
-}
-
-impl Debug for RelayNode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RelayNode")
-            .field("address", &self.address)
-            .field("id", &self.id)
-            .finish()
-    }
-}
-
 /// Struct for serializing node information.
 #[derive(Serialize)]
 struct NodeInfo {
@@ -62,6 +40,38 @@ struct RoomInfo {
     address: String,
     node_id: String,
     participants: Option<usize>,
+}
+
+/// Represents a relay node responsible for handling client connections and room management.
+#[derive(derive_builder::Builder)]
+#[builder(build_fn(name = "build_inner", validate = "Self::validate"))]
+pub struct RelayNode {
+    /// The network address of the relay node.
+    pub address: String,
+
+    /// The unique identifier of the relay node.
+    pub id: String,
+
+    /// Redis client for interacting with the Redis server.
+    #[builder(setter(into))]
+    redis: redis::Client,
+
+    /// Manages broadcasting to clients across rooms.
+    #[builder(default = "Arc::new(BroadcastManager::new())")]
+    broadcast_manager: Arc<BroadcastManager>,
+
+    /// Factory for generating unique IDs.
+    #[builder(default = "Arc::new(IdFactory::new())")]
+    id_factory: Arc<IdFactory>,
+}
+
+impl Debug for RelayNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayNode")
+            .field("address", &self.address)
+            .field("id", &self.id)
+            .finish()
+    }
 }
 
 impl RelayNode {
@@ -85,6 +95,10 @@ impl RelayNode {
         relay_node.start_node_info_worker();
 
         relay_node
+    }
+
+    pub fn builder() -> RelayNodeBuilder {
+        RelayNodeBuilder::default()
     }
 
     /// Starts a background task that periodically reports node info to Redis.
@@ -216,7 +230,7 @@ impl RelayNode {
                 {
                     error!("Failed to set room info in Redis: {}", err);
                 }
-
+                trace!("Room worker updated room info for '{}'", room_name);
                 // Sleep before next report
                 tokio::select! {
                     _ = sleep(Duration::from_secs(5)) => {},
@@ -781,3 +795,61 @@ enum WebSocketError {
 
 unsafe impl Send for WebSocketError {}
 unsafe impl Sync for WebSocketError {}
+
+impl RelayNodeBuilder {
+    pub fn build(&self) -> Result<RelayNode, RelayNodeBuilderError> {
+        // Ensure that the required `redis` field is set
+        let redis = self
+            .redis
+            .clone()
+            .ok_or(RelayNodeBuilderError::UninitializedField("redis"))?;
+
+        // Ensure that `address` is set
+        let address = self
+            .address
+            .clone()
+            .ok_or(RelayNodeBuilderError::UninitializedField("address"))?;
+
+        // Handle `id`: use provided or generate using `id_factory`
+        let id = match &self.id {
+            Some(id_val) => id_val.clone(),
+            None => {
+                let id_factory = self
+                    .id_factory
+                    .clone()
+                    .unwrap_or_else(|| Arc::new(IdFactory::new()));
+                id_factory.gen_id()
+            }
+        };
+
+        // Handle `broadcast_manager`
+        let broadcast_manager = self
+            .broadcast_manager
+            .clone()
+            .unwrap_or_else(|| Arc::new(BroadcastManager::new()));
+
+        // Handle `id_factory`
+        let id_factory = self
+            .id_factory
+            .clone()
+            .unwrap_or_else(|| Arc::new(IdFactory::new()));
+        let node = RelayNode {
+            address,
+            id,
+            redis,
+            broadcast_manager,
+            id_factory,
+        };
+
+        node.start_node_info_worker();
+
+        Ok(node)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let None = self.redis {
+            return Err("You must initialize a RelayNode with a redis client".to_string());
+        }
+        Ok(())
+    }
+}

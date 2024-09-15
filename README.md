@@ -4,21 +4,33 @@ A [Yjs](https://yjs.dev/) compatible, highly available, websockets server.
 
 ## System Design
 
+> This section of the read me is still WIP
+
 ### Components
 
-- Main server
+- Relay Nodes
 - Redis or Redis Cluster
-- Egress worker
 - DB/Storage Persistence Layer
 
-### Highly Available Rooms
+## Local Development
 
-WIP
+To run two RelayNodes and a redis cluster locally, fill out a `.env` based on `.env.template` and run
 
-### Persistence
+```shell
+docker compose up
+```
 
-WIP
+To run the Tui just run
+
+```shell
+cargo run --bin yrs-relay-tui
+```
 
 ## Deployment
 
 WIP
+
+## Screenshots
+
+<img width="1316" alt="Screenshot 2024-09-15 at 11 38 32 AM" src="https://github.com/user-attachments/assets/7dcd2f44-b602-43af-bd6d-057ddeba24bb">
+<img width="1324" alt="Screenshot 2024-09-15 at 11 38 39 AM" src="https://github.com/user-attachments/assets/cc40911a-93b2-4dab-84e7-0890bb6f7bf1">
