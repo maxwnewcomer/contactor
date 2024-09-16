@@ -1,7 +1,5 @@
 # contactor
 
-<!-- A [Yjs](https://yjs.dev/) compatible, highly available, websockets server. -->
-
 A distributed, eventually persisted, websocket framework.
 
 Initially designed to be compatible [Yjs](https://yjs.dev/).
