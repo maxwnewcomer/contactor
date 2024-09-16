@@ -7,9 +7,10 @@ use tokio::net::TcpListener;
 use tracing::info;
 use tracing::warn;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use yrs_relay::api::ws_handler;
-use yrs_relay::api::AppState;
-use yrs_relay::relay::RelayNode;
+
+use contactor::api::ws_handler;
+use contactor::api::AppState;
+use contactor::relay::RelayNode;
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {

@@ -11,7 +11,7 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook  --release --recipe-path recipe.json
 # Build application
 COPY . .
-RUN cargo build --release --package yrs-relay
+RUN cargo build --release --package contactor
 
 # We do not need the Rust toolchain to run the binary!
 FROM debian:stable-slim AS runtime
@@ -21,6 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 
 WORKDIR /app
 
-COPY --from=builder /app/target/release/yrs-relay /usr/local/bin
+COPY --from=builder /app/target/release/contactor /usr/local/bin
 
-ENTRYPOINT ["/usr/local/bin/yrs-relay"]
+ENTRYPOINT ["/usr/local/bin/contactor"]
