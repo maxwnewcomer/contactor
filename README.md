@@ -1,6 +1,8 @@
-# yrs-relay
+# contactor
 
-A [Yjs](https://yjs.dev/) compatible, highly available, websockets server.
+A distributed, eventually persisted, websocket framework.
+
+Initially designed to be compatible [Yjs](https://yjs.dev/).
 
 ## System Design
 
@@ -23,7 +25,7 @@ docker compose up
 To run the Tui just run
 
 ```shell
-cargo run --bin yrs-relay-tui
+cargo run --bin contactor-tui
 ```
 
 ## Deployment
