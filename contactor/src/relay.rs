@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use bon::Builder;
+use bon::bon;
 use futures::{FutureExt, SinkExt, StreamExt};
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
@@ -44,26 +44,20 @@ struct RoomInfo {
 }
 
 /// Represents a relay node responsible for handling client connections and room management.
-#[derive(Builder)]
-#[builder(on(String, into))]
 pub struct RelayNode {
     /// The network address of the relay node.
     pub address: String,
 
     /// The unique identifier of the relay node.
-    #[builder(default = IdFactory::new().gen_id())]
     pub id: String,
 
     /// Redis client for interacting with the Redis server.
-    // #[builder(setter(into))]
     redis: redis::Client,
 
     /// Manages broadcasting to clients across rooms.
-    #[builder(default = Arc::new(BroadcastManager::new()))]
     broadcast_manager: Arc<BroadcastManager>,
 
     /// Factory for generating unique IDs.
-    #[builder(default = Arc::new(IdFactory::new()))]
     id_factory: Arc<IdFactory>,
 }
 
@@ -76,20 +70,31 @@ impl Debug for RelayNode {
     }
 }
 
+#[bon]
 impl RelayNode {
+    #[builder(on(String, into))]
     /// Creates a new `RelayNode` and starts the node info worker.
     ///
     /// # Arguments
     ///
     /// * `address` - The network address of the relay node.
     /// * `redis` - A Redis client.
-    pub fn new(address: String, redis: redis::Client) -> Self {
-        let factory = IdFactory::new();
+    pub fn new(
+        address: String,
+        redis: redis::Client,
+        id_factory: Option<IdFactory>,
+        id: Option<String>,
+        broadcast_manager: Option<BroadcastManager>,
+    ) -> Self {
+        let factory = id_factory.unwrap_or(IdFactory::new());
+        let id = id.unwrap_or(factory.gen_id());
+        let broadcast_manager = broadcast_manager.unwrap_or(BroadcastManager::new());
+
         let relay_node = RelayNode {
             address: address.clone(),
-            id: factory.gen_id(),
+            id: id,
             redis: redis.clone(),
-            broadcast_manager: Arc::new(BroadcastManager::new()),
+            broadcast_manager: Arc::new(broadcast_manager),
             id_factory: Arc::new(factory),
         };
 
