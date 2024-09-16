@@ -3,6 +3,7 @@ name = "contactor"
 version = "0.1.0"
 authors = ["Max Newcomer <maxwnewcomer@gmail.com>"]
 description = "A distributed, eventual persisted, websockets framework."
+repository = "https://github.com/maxwnewcomer/contactor"
 license = "MIT"
 edition = "2021"
 
