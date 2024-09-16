@@ -41,8 +41,7 @@ async fn main() {
     let node = RelayNode::builder()
         .address(config.node_address)
         .redis(redis_client)
-        .build()
-        .expect("failed to build relay node");
+        .build();
 
     // Create AppState
     let app_state = Arc::new(AppState {

@@ -11,9 +11,9 @@ edition = "2021"
 anyhow = "1.0.88"
 axum = { version = "0.7.5", features = ["ws"] }
 axum-extra = { version = "0.9.3", features = ["typed-header"] }
+bon = "2.3"
 config = "0.14.0"
 dashmap = "6.1.0"
-derive_builder = "0.20.1"
 dotenvy = "0.15.7"
 futures = "0.3.30"
 futures-util = { version = "0.3.30", default-features = false, features = [
