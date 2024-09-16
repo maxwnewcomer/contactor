@@ -1,6 +1,10 @@
 [package]
 name = "contactor-tui"
 version = "0.1.0"
+authors = ["Max Newcomer <maxwnewcomer@gmail.com>"]
+description = "Terminal interface for contactor"
+license = "MIT"
+publish = false
 edition = "2021"
 
 [dependencies]

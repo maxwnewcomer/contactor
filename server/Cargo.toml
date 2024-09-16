@@ -1,6 +1,9 @@
 [package]
 name = "contactor"
 version = "0.1.0"
+authors = ["Max Newcomer <maxwnewcomer@gmail.com>"]
+description = "A distributed, eventual persisted, websockets framework."
+license = "MIT"
 edition = "2021"
 
 [dependencies]
