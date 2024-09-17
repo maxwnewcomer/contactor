@@ -11,6 +11,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use contactor::api::ws_handler;
 use contactor::api::AppState;
 use contactor::relay::RelayNode;
+use contactor::storage::RedisStorage;
 
 #[derive(Debug, Deserialize)]
 struct AppConfig {
@@ -37,16 +38,17 @@ async fn main() {
         .expect("failed to read environment");
     // Create Redis client
     let redis_client = RedisClient::open(config.redis_url).expect("Failed to create Redis client");
+    let storage = Arc::new(RedisStorage::new(redis_client));
 
-    let node = RelayNode::builder()
-        .address(config.node_address)
-        .redis(redis_client)
-        .build();
-
+    let node = Arc::new(
+        RelayNode::builder()
+            .address(config.node_address)
+            .storage(storage)
+            .build(),
+    );
+    let node_clone = node.clone();
     // Create AppState
-    let app_state = Arc::new(AppState {
-        node: Arc::new(node),
-    });
+    let app_state = Arc::new(AppState { node });
 
     // Build the application with the correct state
     let app = Router::new()
@@ -59,15 +61,17 @@ async fn main() {
     info!("Listening on 0.0.0.0:3000");
 
     axum::serve(addr, app.into_make_service())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(node_clone))
         .await
         .unwrap();
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(node: Arc<RelayNode>) {
     // Wait for the CTRL+C signal
     tokio::signal::ctrl_c()
         .await
         .expect("Failed to install CTRL+C signal handler");
-    tracing::info!("Shutdown signal received");
+    tracing::info!("Shutdown signal received, starting to drain");
+    node.start_drain().await;
+    tracing::info!("Drain complete, shutting down...");
 }
