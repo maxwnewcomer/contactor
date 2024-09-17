@@ -9,11 +9,10 @@ use axum::extract::ws::{Message, WebSocket};
 use bon::bon;
 use futures::{FutureExt, SinkExt, StreamExt};
 use redis::AsyncCommands;
-use serde::{Deserialize, Serialize};
 use sysinfo::System;
 use thiserror::Error;
 use tokio::sync::{watch, Mutex, RwLock};
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::protocol::Message as TungsteniteMessage;
 use tracing::{debug, error, info, trace};
@@ -22,26 +21,7 @@ use yrs::Doc;
 
 use crate::broadcast::{BroadcastManager, BroadcastManagerError};
 use crate::ids::IdFactory;
-use crate::RedisKeygenerator;
-
-/// Struct for serializing node information.
-#[derive(Serialize)]
-struct NodeInfo {
-    address: String,
-    num_rooms: usize,
-    num_connections: usize,
-    cpu_usage: f32,
-    total_memory: u64,
-    used_memory: u64,
-}
-
-/// Struct for serializing and deserializing room information.
-#[derive(Serialize, Deserialize)]
-struct RoomInfo {
-    address: String,
-    node_id: String,
-    participants: Option<usize>,
-}
+use crate::{DrainingState, NodeInfo, RedisKeygenerator, RoomInfo, RoomState, SyncingState};
 
 /// Represents a relay node responsible for handling client connections and room management.
 pub struct RelayNode {
@@ -199,11 +179,22 @@ impl RelayNode {
                     break;
                 }
 
+                let room_state = {
+                    let room = broadcast_clone.rooms.get(&room_name);
+                    if let Some(room) = room {
+                        let state_guard = room.state.lock().await;
+                        state_guard.clone()
+                    } else {
+                        RoomState::Down // Default or handle as needed
+                    }
+                };
+
                 // Create the room info to report
                 let room_info = RoomInfo {
                     address: address_clone.clone(),
                     node_id: id.clone(),
                     participants: broadcast_clone.listeners(&room_name),
+                    status: room_state, // Include the state
                 };
 
                 // Report to Redis
@@ -284,130 +275,234 @@ impl RelayNode {
 
             if room_info.address == self.address {
                 // Room is hosted on this server
-                debug!("Handling connection to '{}' locally", room_name);
-                self.handle_socket(socket, room_name.clone()).await;
+                match room_info.status {
+                    RoomState::Up => {
+                        // Room is ready; handle the socket
+                        debug!("Handling connection to '{}' locally", room_name);
+                        self.handle_socket(socket, room_name.clone()).await;
+                    }
+                    RoomState::Syncing(_) => {
+                        // Room is syncing; wait until it's up
+                        debug!(
+                            "Room '{}' is syncing. Waiting for it to become Up",
+                            room_name
+                        );
+                        self.wait_for_room_to_be_up(socket, room_name.clone()).await;
+                    }
+                    _ => {
+                        // Other states: attempt to take over or handle accordingly
+                        debug!(
+                            "Room '{}' is in state {:?}. Attempting takeover.",
+                            room_name, room_info.status
+                        );
+                        match self.attempt_room_takeover(socket, room_name.clone()).await {
+                            Ok(new_socket) => {
+                                self.handle_socket(new_socket, room_name.clone()).await;
+                            }
+                            Err(Some((new_socket, new_server_address))) => {
+                                // Another server took over; build relay to new server
+                                self.build_relay(new_socket, new_server_address, room_name.clone())
+                                    .await;
+                            }
+                            Err(None) => {
+                                // Failed to take over and no new server address; cannot proceed
+                                error!("Failed to take over room '{}'", room_name);
+                            }
+                        }
+                    }
+                }
             } else {
-                debug!(
-                    "Expecting room '{}' to be hosted at {}, building relay",
-                    room_name, room_info.address
-                );
-                // Room is on a different server; build a relay
-                self.build_relay(socket, room_info.address.clone(), room_name.clone())
-                    .await;
+                // Room is on a different server
+                match room_info.status {
+                    RoomState::Up => {
+                        // Build relay to the room's server
+                        debug!(
+                            "Expecting room '{}' to be hosted at {}, building relay",
+                            room_name, room_info.address
+                        );
+                        self.build_relay(socket, room_info.address.clone(), room_name.clone())
+                            .await;
+                    }
+                    _ => {
+                        // Room is not up; attempt to take over
+                        debug!(
+                            "Room '{}' is in state {:?} on server {}. Attempting takeover.",
+                            room_name, room_info.status, room_info.address
+                        );
+                        match self.attempt_room_takeover(socket, room_name.clone()).await {
+                            Ok(new_socket) => {
+                                self.handle_socket(new_socket, room_name.clone()).await;
+                            }
+                            Err(Some((new_socket, new_server_address))) => {
+                                // Another server took over; build relay to new server
+                                self.build_relay(new_socket, new_server_address, room_name.clone())
+                                    .await;
+                            }
+                            Err(None) => {
+                                // Failed to take over and no new server address; cannot proceed
+                                error!("Failed to take over room '{}'", room_name);
+                            }
+                        }
+                    }
+                }
             }
         } else {
-            // Room does not exist or TTL expired; attempt to create it atomically
-
-            // Create room locally so that once new connections get sent the room is ready
-            match self
-                .broadcast_manager
-                .create_room(
-                    &room_name,
-                    Arc::new(RwLock::new(Awareness::new(Doc::new()))),
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "Failed to create room '{}' in broadcast manager: {}",
-                        room_name,
-                        e.to_string()
-                    );
-                    return;
-                }
-            }
-
-            // Try to set the room info in Redis with NX and TTL
-            let room_info = RoomInfo {
-                address: self.address.clone(),
-                node_id: self.id.clone(),
-                participants: self.broadcast_manager.listeners(&room_name),
-            };
-
-            // Serialize room_info to JSON
-            let room_info_json = match serde_json::to_string(&room_info) {
-                Ok(json) => json,
-                Err(err) => {
-                    error!("Failed to serialize room info: {}", err);
-                    return;
-                }
-            };
-
-            // Use a Lua script to set the room info with NX and TTL atomically
-            let script = redis::Script::new(
-                r#"
-                local setnx = redis.call('SETNX', KEYS[1], ARGV[1])
-                if setnx == 1 then
-                    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-                end
-                return setnx
-                "#,
+            // Room does not exist; attempt to create it
+            debug!(
+                "Room '{}' does not exist. Attempting to create it.",
+                room_name
             );
-
-            let ttl_seconds = 10;
-            let set_result: i32 = match script
-                .key(&room_key)
-                .arg(&room_info_json)
-                .arg(ttl_seconds)
-                .invoke_async(&mut redis_conn)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    error!("Failed to set room info in Redis: {}", err);
-                    return;
+            match self.create_room_and_set_info(&room_name).await {
+                Ok(()) => {
+                    // Now, handle the socket
+                    self.handle_socket(socket, room_name.clone()).await;
                 }
-            };
+                Err(_) => {
+                    // Another server created the room; get updated room info and proceed
+                    let room_info_json: Option<String> = match redis_conn.get(&room_key).await {
+                        Ok(info) => info,
+                        Err(err) => {
+                            error!("Failed to get room info from Redis after set_nx: {}", err);
+                            return;
+                        }
+                    };
+                    if let Some(room_info_json) = room_info_json {
+                        let room_info: RoomInfo = match serde_json::from_str(&room_info_json) {
+                            Ok(info) => info,
+                            Err(err) => {
+                                error!("Failed to parse room info JSON: {}", err);
+                                return;
+                            }
+                        };
 
-            if set_result == 1 {
-                // Successfully created the room in Redis
-                debug!("Room '{}' didn't exist so I created it", room_name);
-
-                // Start the room info worker to refresh TTL
-                let (shutdown_tx, shutdown_rx) = watch::channel(());
-                self.broadcast_manager
-                    .store_room_shutdown_signal(&room_name, shutdown_tx)
-                    .await;
-
-                self.start_room_info_worker(room_name.clone(), shutdown_rx);
-                // Handle the socket
-                self.handle_socket(socket, room_name.clone()).await;
-            } else {
-                // Another server created the room; get the updated room info
-
-                // Tear down local room
-                if let Err(e) = self.broadcast_manager.drop_room(&room_name) {
-                    error!(
-                        "Failed to remove pre-created room from broadcast manager: {}",
-                        e
-                    );
+                        if room_info.address == self.address {
+                            // Room is hosted on this server now
+                            self.handle_socket(socket, room_name.clone()).await;
+                        } else {
+                            // Build relay to new server
+                            self.build_relay(socket, room_info.address.clone(), room_name.clone())
+                                .await;
+                        }
+                    } else {
+                        // No room info; cannot proceed
+                        error!("Failed to retrieve updated room info for '{}'", room_name);
+                    }
                 }
-
-                // Get new room info
-                let room_info_json: String = match redis_conn.get(&room_key).await {
-                    Ok(info) => info,
-                    Err(err) => {
-                        error!("Failed to get room info from Redis after set_nx: {}", err);
-                        return;
-                    }
-                };
-
-                let room_info: RoomInfo = match serde_json::from_str(&room_info_json) {
-                    Ok(info) => info,
-                    Err(err) => {
-                        error!("Failed to parse room info JSON: {}", err);
-                        return;
-                    }
-                };
-
-                debug!(
-                    "Tried to build room '{}' but {} got to it first, building relay",
-                    room_name, room_info.address
-                );
-                self.build_relay(socket, room_info.address.clone(), room_name.clone())
-                    .await;
             }
+        }
+    }
+
+    async fn create_room_and_set_info(&self, room_name: &str) -> Result<(), String> {
+        // Create room locally
+        match self
+            .broadcast_manager
+            .create_room(room_name, Arc::new(RwLock::new(Awareness::new(Doc::new()))))
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let err_msg = format!(
+                    "Failed to create room '{}' in broadcast manager: {}",
+                    room_name,
+                    e.to_string()
+                );
+                error!("{}", err_msg);
+                return Err(err_msg);
+            }
+        }
+
+        // Try to set the room info in Redis with NX and TTL
+        let room_info = RoomInfo {
+            address: self.address.clone(),
+            node_id: self.id.clone(),
+            participants: self.broadcast_manager.listeners(room_name),
+            status: RoomState::Down, // Room is in Down state initially
+        };
+
+        // Serialize room_info to JSON
+        let room_info_json = match serde_json::to_string(&room_info) {
+            Ok(json) => json,
+            Err(err) => {
+                let err_msg = format!("Failed to serialize room info: {}", err);
+                error!("{}", err_msg);
+                return Err(err_msg);
+            }
+        };
+
+        // Use a Lua script to set the room info with NX and TTL atomically
+        let script = redis::Script::new(
+            r#"
+            local setnx = redis.call('SETNX', KEYS[1], ARGV[1])
+            if setnx == 1 then
+                redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
+            end
+            return setnx
+            "#,
+        );
+
+        let ttl_seconds = 10;
+        let room_key = RedisKeygenerator::room_key(room_name);
+        let mut redis_conn = match self.redis.get_multiplexed_async_connection().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                let err_msg = format!("Failed to get Redis connection: {}", err);
+                error!("{}", err_msg);
+                return Err(err_msg);
+            }
+        };
+
+        let set_result: i32 = match script
+            .key(&room_key)
+            .arg(&room_info_json)
+            .arg(ttl_seconds)
+            .invoke_async(&mut redis_conn)
+            .await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                let err_msg = format!("Failed to set room info in Redis: {}", err);
+                error!("{}", err_msg);
+                return Err(err_msg);
+            }
+        };
+
+        if set_result == 1 {
+            // Successfully created the room in Redis
+            debug!("Room '{}' didn't exist so I created it", room_name);
+
+            // Start the room info worker to refresh TTL
+            let (shutdown_tx, shutdown_rx) = watch::channel(());
+            self.broadcast_manager
+                .store_room_shutdown_signal(room_name, shutdown_tx)
+                .await;
+
+            self.start_room_info_worker(room_name.to_string(), shutdown_rx);
+
+            // Start syncing process
+            self.broadcast_manager.start_syncing(room_name).await;
+
+            Ok(())
+        } else {
+            // Another server created the room; get the updated room info
+
+            // Tear down local room
+            if let Err(e) = self.broadcast_manager.drop_room(room_name) {
+                error!(
+                    "Failed to remove pre-created room from broadcast manager: {}",
+                    e
+                );
+            }
+
+            Err("Room already exists".to_string())
+        }
+    }
+
+    fn can_take_over(&self, room_info: &RoomInfo, ttl: i32) -> bool {
+        match room_info.status {
+            RoomState::Down => true,
+            RoomState::Syncing(SyncingState::Fail) => true,
+            RoomState::Draining(DrainingState::Fail) => true,
+            _ => ttl <= 0,
         }
     }
 
@@ -555,98 +650,112 @@ impl RelayNode {
             }
         };
 
-        // If the room info does not exist or TTL is expired, attempt to take over
-        let can_takeover = room_info_json.is_none() || ttl <= 0;
-
-        if can_takeover {
-            // Try to set the room info in Redis with NX and TTL
-            let room_info = RoomInfo {
-                address: self.address.clone(),
-                node_id: self.id.clone(),
-                participants: self.broadcast_manager.listeners(&room_name),
-            };
-
-            // Serialize room_info to JSON
-            let room_info_json = match serde_json::to_string(&room_info) {
-                Ok(json) => json,
-                Err(err) => {
-                    error!("Failed to serialize room info: {}", err);
-                    return Err(None);
-                }
-            };
-
-            // Use a Lua script to set the room info with NX and TTL atomically
-            let script = redis::Script::new(
-                r#"
-                local setnx = redis.call('SETNX', KEYS[1], ARGV[1])
-                if setnx == 1 then
-                    redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2]))
-                end
-                return setnx
-                "#,
-            );
-
-            let ttl_seconds = 10;
-            let set_result: i32 = match script
-                .key(room_key.clone())
-                .arg(&room_info_json)
-                .arg(ttl_seconds)
-                .invoke_async(&mut redis_conn)
-                .await
-            {
-                Ok(result) => result,
-                Err(err) => {
-                    error!("Failed to set room info in Redis: {}", err);
-                    return Err(None);
-                }
-            };
-
-            if set_result == 1 {
-                // Successfully took over the room
-
-                // Start the room info worker to refresh TTL
-                let (shutdown_tx, shutdown_rx) = watch::channel(());
-                self.broadcast_manager
-                    .store_room_shutdown_signal(&room_name, shutdown_tx)
-                    .await;
-
-                self.start_room_info_worker(room_name.clone(), shutdown_rx);
-
-                Ok(socket)
-            } else {
-                // Another server took over the room; get the new server address
-                let room_info_json: String = match redis_conn.get(&room_key).await {
-                    Ok(info) => info,
-                    Err(err) => {
-                        error!("Failed to get room info from Redis after set_nx: {}", err);
-                        return Err(None);
-                    }
-                };
-
-                let room_info: RoomInfo = match serde_json::from_str(&room_info_json) {
+        let can_takeover = match &room_info_json {
+            Some(json) => {
+                let room_info: RoomInfo = match serde_json::from_str(&json) {
                     Ok(info) => info,
                     Err(err) => {
                         error!("Failed to parse room info JSON: {}", err);
                         return Err(None);
                     }
                 };
+                self.can_take_over(&room_info, ttl)
+            }
+            None => true, // No room info, can attempt to take over
+        };
 
-                Err(Some((socket, room_info.address)))
+        if can_takeover {
+            // Proceed to take over the room
+            match self.create_room_and_set_info(&room_name).await {
+                Ok(()) => Ok(socket),
+                Err(_) => {
+                    // Another server took over; get updated room info
+                    let room_info_json: Option<String> = match redis_conn.get(&room_key).await {
+                        Ok(info) => info,
+                        Err(err) => {
+                            error!("Failed to get room info from Redis after set_nx: {}", err);
+                            return Err(None);
+                        }
+                    };
+                    if let Some(room_info_json) = room_info_json {
+                        let room_info: RoomInfo = match serde_json::from_str(&room_info_json) {
+                            Ok(info) => info,
+                            Err(err) => {
+                                error!("Failed to parse room info JSON: {}", err);
+                                return Err(None);
+                            }
+                        };
+
+                        Err(Some((socket, room_info.address)))
+                    } else {
+                        // No room info; cannot proceed
+                        error!("Failed to retrieve updated room info for '{}'", room_name);
+                        Err(None)
+                    }
+                }
             }
         } else {
-            // Another process updated the key; get the new server address
+            // Cannot take over, return Err with updated room address
             let room_info_json = room_info_json.unwrap();
             let room_info: RoomInfo = match serde_json::from_str(&room_info_json) {
                 Ok(info) => info,
                 Err(err) => {
-                    error!(
-                        "Failed to parse room info JSON from Redis after DEL failed: {}",
-                        err
-                    );
+                    error!("Failed to parse room info JSON: {}", err);
                     return Err(None);
                 }
             };
             Err(Some((socket, room_info.address)))
+        }
+    }
+
+    async fn wait_for_room_to_be_up(&self, socket: WebSocket, room_name: String) {
+        let room = match self.broadcast_manager.rooms.get(&room_name) {
+            Some(room) => room,
+            None => {
+                error!(
+                    "Room '{}' not found while waiting for it to become Up",
+                    room_name
+                );
+                return;
+            }
+        };
+
+        let wait_duration = Duration::from_secs(10); // Adjust as needed
+
+        if let Ok(_) = timeout(wait_duration, async {
+            loop {
+                let state = {
+                    let state_guard = room.state.lock().await;
+                    state_guard.clone()
+                };
+
+                match state {
+                    RoomState::Up => {
+                        // Now handle the socket
+                        self.handle_socket(socket, room_name.clone()).await;
+                        break;
+                    }
+                    RoomState::Syncing(_) => {
+                        // Still syncing; wait and check again
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                    _ => {
+                        // Room transitioned to a different state; break the loop
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        {
+            // Successfully waited for room to be Up
+        } else {
+            // Timeout occurred
+            error!(
+                "Timeout while waiting for room '{}' to become Up",
+                room_name
+            );
+            // Handle timeout (e.g., attempt takeover or inform the client)
         }
     }
 
