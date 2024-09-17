@@ -6,7 +6,10 @@ pub mod api;
 pub mod broadcast;
 pub mod relay;
 
+pub(crate) mod common;
 pub(crate) mod ids;
+
+pub use crate::common::*;
 
 /// A utility struct for generating Redis keys for rooms and nodes.
 pub(crate) struct RedisKeygenerator {}
