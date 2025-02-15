@@ -2,14 +2,14 @@ use std::error::Error;
 use std::io;
 use std::time::Duration;
 
+use contactor::{NodeInfo, RoomInfo};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dotenvy::dotenv;
-use redis::{AsyncCommands, FromRedisValue, RedisError};
-use serde::Deserialize;
+use redis::AsyncCommands;
 use tokio::sync::mpsc;
 use tokio::time;
 use tui::{
@@ -21,71 +21,29 @@ use tui::{
     Frame, Terminal,
 };
 
-// Define Node and Room structures
-#[derive(Debug, Deserialize, Clone)]
-struct Node {
-    address: String,
-    num_rooms: u32,
-    num_connections: u32,
-    cpu_usage: f64,
-    total_memory: u64,
-    used_memory: u64,
-}
-
-impl FromRedisValue for Node {
-    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
-        let json_str: String = redis::FromRedisValue::from_redis_value(v)?;
-        serde_json::from_str(&json_str).map_err(|_| {
-            RedisError::from((
-                redis::ErrorKind::TypeError,
-                "Failed to parse Node from JSON",
-            ))
-        })
-    }
-}
-
-#[derive(Debug, Deserialize, Clone)]
-struct Room {
-    address: String,
-    node_id: String,
-    participants: u32,
-}
-
-impl FromRedisValue for Room {
-    fn from_redis_value(v: &redis::Value) -> redis::RedisResult<Self> {
-        let json_str: String = redis::FromRedisValue::from_redis_value(v)?;
-        serde_json::from_str(&json_str).map_err(|_| {
-            RedisError::from((
-                redis::ErrorKind::TypeError,
-                "Failed to parse Room from JSON",
-            ))
-        })
-    }
-}
-
 // Enum for Tabs
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
-    Nodes,
-    Rooms,
+    NodeInfos,
+    RoomInfos,
 }
 
 impl Page {
     fn next(&self) -> Self {
         match self {
-            Page::Nodes => Page::Rooms,
-            Page::Rooms => Page::Nodes,
+            Page::NodeInfos => Page::RoomInfos,
+            Page::RoomInfos => Page::NodeInfos,
         }
     }
 
     fn titles() -> Vec<&'static str> {
-        vec!["Nodes", "Rooms"]
+        vec!["NodeInfos", "RoomInfos"]
     }
 
     fn index(&self) -> usize {
         match self {
-            Page::Nodes => 0,
-            Page::Rooms => 1,
+            Page::NodeInfos => 0,
+            Page::RoomInfos => 1,
         }
     }
 }
@@ -128,9 +86,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     });
 
     // Initialize application state
-    let mut page = Page::Nodes;
-    let mut nodes: Vec<(String, Node)> = Vec::new();
-    let mut rooms: Vec<(String, Room)> = Vec::new();
+    let mut page = Page::NodeInfos;
+    let mut nodes: Vec<(String, NodeInfo)> = Vec::new();
+    let mut rooms: Vec<(String, RoomInfo)> = Vec::new();
 
     // Redis connection
     let client = redis::Client::open(redis_url)?;
@@ -189,14 +147,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 /// Fetches data from Redis and updates the nodes and rooms vectors.
 async fn update_data(
     con: &mut redis::aio::MultiplexedConnection,
-    nodes: &mut Vec<(String, Node)>,
-    rooms: &mut Vec<(String, Room)>,
+    nodes: &mut Vec<(String, NodeInfo)>,
+    rooms: &mut Vec<(String, RoomInfo)>,
 ) -> Result<(), Box<dyn Error>> {
     // Fetch nodes
     let node_keys: Vec<String> = con.keys("node:*").await?;
     nodes.clear();
     if !node_keys.is_empty() {
-        let node_values: Vec<Option<Node>> = con.mget(&node_keys).await?;
+        let node_values: Vec<Option<NodeInfo>> = con.mget(&node_keys).await?;
         for (key, node_opt) in node_keys.into_iter().zip(node_values.into_iter()) {
             if let Some(node) = node_opt {
                 nodes.push((key, node));
@@ -208,7 +166,7 @@ async fn update_data(
     let room_keys: Vec<String> = con.keys("room:*").await?;
     rooms.clear();
     if !room_keys.is_empty() {
-        let room_values: Vec<Option<Room>> = con.mget(&room_keys).await?;
+        let room_values: Vec<Option<RoomInfo>> = con.mget(&room_keys).await?;
         for (key, room_opt) in room_keys.into_iter().zip(room_values.into_iter()) {
             if let Some(room) = room_opt {
                 rooms.push((key, room));
@@ -223,8 +181,8 @@ async fn update_data(
 fn ui<B: Backend>(
     f: &mut Frame<B>,
     page: Page,
-    nodes: &Vec<(String, Node)>,
-    rooms: &Vec<(String, Room)>,
+    nodes: &Vec<(String, NodeInfo)>,
+    rooms: &Vec<(String, RoomInfo)>,
 ) {
     // Define layout with an additional constraint for the footer
     let chunks = Layout::default()
@@ -257,8 +215,8 @@ fn ui<B: Backend>(
 
     // Content
     match page {
-        Page::Nodes => render_nodes(f, chunks[1], nodes),
-        Page::Rooms => render_rooms(f, chunks[1], rooms),
+        Page::NodeInfos => render_nodes(f, chunks[1], nodes),
+        Page::RoomInfos => render_rooms(f, chunks[1], rooms),
     }
 
     // Footer with exit instruction
@@ -268,17 +226,17 @@ fn ui<B: Backend>(
     f.render_widget(footer, chunks[2]);
 }
 
-/// Renders the Nodes table.
+/// Renders the NodeInfos table.
 fn render_nodes<B: Backend>(
     f: &mut Frame<B>,
     area: tui::layout::Rect,
-    nodes: &Vec<(String, Node)>,
+    nodes: &Vec<(String, NodeInfo)>,
 ) {
     // Define table headers
     let header = [
         "Key",
         "Address",
-        "# Rooms",
+        "# RoomInfos",
         "# Connections",
         "CPU Usage",
         "Total Memory",
@@ -318,7 +276,7 @@ fn render_nodes<B: Backend>(
             )
             .bottom_margin(1),
         )
-        .block(Block::default().borders(Borders::ALL).title("Nodes"))
+        .block(Block::default().borders(Borders::ALL).title("NodeInfos"))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .widths(&[
             Constraint::Length(20),
@@ -334,14 +292,14 @@ fn render_nodes<B: Backend>(
     f.render_widget(table, area);
 }
 
-/// Renders the Rooms table.
+/// Renders the RoomInfos table.
 fn render_rooms<B: Backend>(
     f: &mut Frame<B>,
     area: tui::layout::Rect,
-    rooms: &Vec<(String, Room)>,
+    rooms: &Vec<(String, RoomInfo)>,
 ) {
     // Define table headers
-    let header = ["Key", "Address", "Node ID", "Participants"];
+    let header = ["Key", "Address", "NodeInfo ID", "Participants", "Status"];
 
     // Create table rows
     let rows: Vec<Row> = rooms
@@ -351,7 +309,8 @@ fn render_rooms<B: Backend>(
                 Cell::from(k.clone()),
                 Cell::from(r.address.clone()),
                 Cell::from(r.node_id.clone()),
-                Cell::from(r.participants.to_string()),
+                Cell::from(r.participants.unwrap_or(0).to_string()),
+                Cell::from(serde_json::to_string(&r.status).unwrap_or("UNKNOWN".to_string())),
             ])
         })
         .collect();
@@ -373,13 +332,14 @@ fn render_rooms<B: Backend>(
             )
             .bottom_margin(1),
         )
-        .block(Block::default().borders(Borders::ALL).title("Rooms"))
+        .block(Block::default().borders(Borders::ALL).title("RoomInfos"))
         .highlight_style(Style::default().add_modifier(Modifier::BOLD))
         .widths(&[
             Constraint::Length(20),
             Constraint::Length(15),
             Constraint::Length(25),
             Constraint::Length(15),
+            Constraint::Length(20),
         ]);
 
     // Render table

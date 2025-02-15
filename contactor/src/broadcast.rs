@@ -1,28 +1,32 @@
 //! Module responsible for managing broadcasting to multiple subscribers within rooms.
-
-use anyhow::Result;
-use dashmap::DashMap;
-use futures::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::Result;
+use bon::bon;
+use dashmap::DashMap;
+use futures::{SinkExt, StreamExt};
 use thiserror::Error;
 use tokio::sync::{watch, Mutex};
+use tokio::time::sleep;
 use yrs_warp::{
     broadcast::{BroadcastGroup, Subscription},
     AwarenessRef,
 };
 
-/// The default capacity for the broadcast buffer.
-const DEFAULT_BUFFER_CAPACITY: usize = 16;
+use crate::{DrainingState, RoomState, SyncingState};
 
 /// Represents a chat room with a broadcast group and listener count.
-struct Room {
+pub struct Room {
     /// The broadcast group for the room.
     bcast: Arc<BroadcastGroup>,
     /// The number of listeners connected to the room.
     listeners: AtomicUsize,
+    /// The current state of the room
+    pub(crate) state: Arc<Mutex<RoomState>>,
 }
 
 /// Errors that can occur when managing broadcasts.
@@ -48,9 +52,24 @@ pub enum BroadcastManagerError {
 /// Manages broadcasting messages to subscribers across multiple rooms.
 pub struct BroadcastManager {
     /// A thread-safe map of room names to their corresponding `Room` instances.
-    rooms: DashMap<String, Room>,
+    pub(crate) rooms: DashMap<String, Room>,
     /// A mutex-protected map for room shutdown signals.
     room_shutdown_signals: Mutex<HashMap<String, watch::Sender<()>>>,
+    max_sync_retries: u32,
+    max_drain_retries: u32,
+    buffer_capacity: usize,
+}
+
+impl Default for BroadcastManager {
+    fn default() -> Self {
+        Self {
+            rooms: Default::default(),
+            room_shutdown_signals: Default::default(),
+            max_sync_retries: 3,
+            max_drain_retries: 3,
+            buffer_capacity: 16,
+        }
+    }
 }
 
 impl Debug for BroadcastManager {
@@ -62,12 +81,21 @@ impl Debug for BroadcastManager {
     }
 }
 
+#[bon]
 impl BroadcastManager {
+    #[builder(on(u32, into))]
     /// Creates a new `BroadcastManager`.
-    pub fn new() -> Self {
+    pub fn new(
+        #[builder(name = with_buffer_capacity)] buffer_capacity: Option<usize>,
+        #[builder(name = with_max_sync_retries)] max_sync_retries: Option<u32>,
+        #[builder(name = with_max_drain_retries)] max_drain_retries: Option<u32>,
+    ) -> Self {
         Self {
             rooms: DashMap::new(),
             room_shutdown_signals: Mutex::new(HashMap::new()),
+            max_sync_retries: max_sync_retries.unwrap_or(3),
+            max_drain_retries: max_drain_retries.unwrap_or(3),
+            buffer_capacity: buffer_capacity.unwrap_or(16),
         }
     }
 
@@ -93,6 +121,10 @@ impl BroadcastManager {
         self.rooms
             .get(room_name)
             .map(|room| room.listeners.load(Ordering::Relaxed))
+    }
+
+    pub fn get_room(&self, room_name: &str) -> Option<dashmap::mapref::one::Ref<String, Room>> {
+        self.rooms.get(room_name)
     }
 
     /// Subscribes a client to a room's broadcast group.
@@ -209,10 +241,15 @@ impl BroadcastManager {
             });
         }
         let room = Room {
-            bcast: Arc::new(BroadcastGroup::new(awareness, DEFAULT_BUFFER_CAPACITY).await),
+            bcast: Arc::new(BroadcastGroup::new(awareness, self.buffer_capacity).await),
             listeners: AtomicUsize::new(0),
+            state: Arc::new(Mutex::new(RoomState::Down)),
         };
         self.rooms.insert(room_name.to_string(), room);
+
+        // Start syncing process
+        self.start_syncing(room_name).await;
+
         Ok(())
     }
 
@@ -244,6 +281,122 @@ impl BroadcastManager {
         let mut signals = self.room_shutdown_signals.lock().await;
         signals.remove(room_name)
     }
+
+    pub async fn start_syncing(&self, room_name: &str) {
+        let room = match self.rooms.get(room_name) {
+            Some(room) => room,
+            None => return, // Room doesn't exist
+        };
+
+        // Clone for async move
+        let state = room.state.clone();
+        let room_name = room_name.to_string();
+        let max_retries = self.max_sync_retries;
+
+        tokio::spawn(async move {
+            let mut retry_count = 0;
+
+            loop {
+                {
+                    let mut state_guard = state.lock().await;
+                    *state_guard = RoomState::Syncing(SyncingState::Load(retry_count));
+                }
+
+                // Attempt to load data (replace with your actual load logic)
+                match attempt_load(&room_name).await {
+                    Ok(_) => {
+                        let mut state_guard = state.lock().await;
+                        *state_guard = RoomState::Syncing(SyncingState::Success);
+                        break;
+                    }
+                    Err(_) if retry_count < max_retries => {
+                        retry_count += 1;
+                        {
+                            let mut state_guard = state.lock().await;
+                            *state_guard = RoomState::Syncing(SyncingState::RetryLoad(retry_count));
+                        }
+                        // Wait before retrying
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(_) => {
+                        let mut state_guard = state.lock().await;
+                        *state_guard = RoomState::Syncing(SyncingState::Fail);
+                        // Handle failure (e.g., log, alert)
+                        return;
+                    }
+                }
+            }
+
+            // Transition to UP state
+            {
+                let mut state_guard = state.lock().await;
+                *state_guard = RoomState::Up;
+            }
+        });
+    }
+
+    pub async fn start_draining(&self, room_name: &str) {
+        let room = match self.rooms.get(room_name) {
+            Some(room) => room,
+            None => return, // Room doesn't exist
+        };
+        let state = room.state.clone();
+        let room_name = room_name.to_string();
+        let max_retries = self.max_drain_retries;
+
+        let mut retry_count = 0;
+
+        {
+            let mut state_guard = state.lock().await;
+            *state_guard = RoomState::Draining(DrainingState::Store(retry_count));
+        }
+
+        loop {
+            // Attempt to store data (replace with your actual store logic)
+            match attempt_store(&room_name).await {
+                Ok(_) => {
+                    let mut state_guard = state.lock().await;
+                    *state_guard = RoomState::Draining(DrainingState::Success);
+                    break;
+                }
+                Err(_) if retry_count < max_retries => {
+                    retry_count += 1;
+                    {
+                        let mut state_guard = state.lock().await;
+                        *state_guard = RoomState::Draining(DrainingState::RetryStore(retry_count));
+                    }
+                    // Wait before retrying
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+                Err(_) => {
+                    let mut state_guard = state.lock().await;
+                    *state_guard = RoomState::Draining(DrainingState::Fail);
+                    // Handle failure (e.g., log, alert)
+                    return;
+                }
+            }
+        }
+
+        // Transition to DOWN state and remove room
+        {
+            let mut state_guard = state.lock().await;
+            *state_guard = RoomState::Down;
+        }
+    }
+}
+
+// Mock function to simulate storing
+async fn attempt_load(_room_name: &str) -> Result<(), ()> {
+    // Implement your actual data storing logic here
+    sleep(Duration::from_secs(10)).await;
+    Ok(())
+}
+
+// Mock function to simulate storing
+async fn attempt_store(_room_name: &str) -> Result<(), ()> {
+    // Implement your actual data storing logic here
+    sleep(Duration::from_secs(20)).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -272,7 +425,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_room() {
-        let manager = BroadcastManager::new();
+        let manager = BroadcastManager::default();
         let awareness = create_mock_awareness();
 
         // Test creating a new room
@@ -291,7 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_and_unsubscribe() {
-        let manager = BroadcastManager::new();
+        let manager = BroadcastManager::default();
         let awareness = create_mock_awareness();
 
         // Create a room
@@ -319,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_drop_room() {
-        let manager = BroadcastManager::new();
+        let manager = BroadcastManager::default();
         let awareness = create_mock_awareness();
 
         // Create a room
@@ -351,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_subscriptions() {
-        let manager = BroadcastManager::new();
+        let manager = BroadcastManager::default();
         let awareness = create_mock_awareness();
 
         // Create a room
@@ -383,7 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complex_concurrent_operations() {
-        let manager = Arc::new(BroadcastManager::new());
+        let manager = Arc::new(BroadcastManager::default());
         let num_rooms = 30;
         let num_operations_per_room = 100;
 
